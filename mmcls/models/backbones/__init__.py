@@ -33,6 +33,7 @@ from .resnet import ResNet, ResNetV1c, ResNetV1d
 from .resnet_cifar import ResNet_CIFAR
 from .resnext import ResNeXt
 from .revvit import RevVisionTransformer
+from .riformer import RIFormer
 from .seresnet import SEResNet
 from .seresnext import SEResNeXt
 from .shufflenet_v1 import ShuffleNetV1
@@ -88,6 +89,7 @@ __all__ = [
     'RepLKNet',
     'RepMLPNet',
     'PoolFormer',
+    'RIFormer',
     'DenseNet',
     'VAN',
     'InceptionV3',

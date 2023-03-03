@@ -66,6 +66,28 @@ class Pooling(nn.Module):
         return self.pool(x) - x
 
 
+class Affine(nn.Module):
+    """Affine Transformation module.
+
+    Args:
+        in_features (int): Input dimension. Defaults to None.
+    """
+
+    def __init__(self, in_features=None):
+        super().__init__()
+        self.affine = nn.Conv2d(
+            in_features,
+            in_features,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=in_features,
+            bias=True)
+
+    def forward(self, x):
+        return self.affine(x) - x
+
+
 class Mlp(nn.Module):
     """Mlp implemented by with 1*1 convolutions.
 
@@ -103,12 +125,11 @@ class Mlp(nn.Module):
         return x
 
 
-class PoolFormerBlock(BaseModule):
-    """PoolFormer Block.
+class RIFormerBlock(BaseModule):
+    """RIFormer Block.
 
     Args:
         dim (int): Embedding dim.
-        pool_size (int): Pooling size. Defaults to 3.
         mlp_ratio (float): Mlp expansion ratio. Defaults to 4.
         norm_cfg (dict): The config dict for norm layers.
             Defaults to ``dict(type='GN', num_groups=1)``.
@@ -118,22 +139,27 @@ class PoolFormerBlock(BaseModule):
         drop_path (float): Stochastic depth rate. Defaults to 0.
         layer_scale_init_value (float): Init value for Layer Scale.
             Defaults to 1e-5.
+        deploy (bool): Whether to switch the model structure to
+            deployment mode. Default: False.
     """
 
     def __init__(self,
                  dim,
-                 pool_size=3,
                  mlp_ratio=4.,
                  norm_cfg=dict(type='GN', num_groups=1),
                  act_cfg=dict(type='GELU'),
                  drop=0.,
                  drop_path=0.,
-                 layer_scale_init_value=1e-5):
+                 layer_scale_init_value=1e-5,
+                 deploy=False):
 
         super().__init__()
 
-        self.norm1 = build_norm_layer(norm_cfg, dim)[1]
-        self.token_mixer = Pooling(pool_size=pool_size)
+        if deploy:
+            self.norm_reparam = build_norm_layer(norm_cfg, dim)[1]
+        else:
+            self.norm1 = build_norm_layer(norm_cfg, dim)[1]
+            self.token_mixer = Affine(in_features=dim)
         self.norm2 = build_norm_layer(norm_cfg, dim)[1]
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(
@@ -142,52 +168,91 @@ class PoolFormerBlock(BaseModule):
             act_cfg=act_cfg,
             drop=drop)
 
-        # The following two techniques are useful to train deep PoolFormers.
+        # The following two techniques are useful to train deep RIFormers.
         self.drop_path = DropPath(drop_path) if drop_path > 0. \
             else nn.Identity()
         self.layer_scale_1 = nn.Parameter(
             layer_scale_init_value * torch.ones((dim)), requires_grad=True)
         self.layer_scale_2 = nn.Parameter(
             layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+        self.norm_cfg = norm_cfg
+        self.dim = dim
+        self.deploy = deploy
 
     def forward(self, x):
-        x = x + self.drop_path(
-            self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) *
-            self.token_mixer(self.norm1(x)))
-        x = x + self.drop_path(
-            self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) *
-            self.mlp(self.norm2(x)))
+        if hasattr(self, 'norm_reparam'):
+            x = x + self.drop_path(
+                self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) *
+                self.norm_reparam(x))
+            x = x + self.drop_path(
+                self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) *
+                self.mlp(self.norm2(x)))
+        else:
+            x = x + self.drop_path(
+                self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) *
+                self.token_mixer(self.norm1(x)))
+            x = x + self.drop_path(
+                self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) *
+                self.mlp(self.norm2(x)))
         return x
+
+    def fuse_affine(self, norm, token_mixer):
+        gamma_affn = token_mixer.affine.weight.reshape(-1)
+        gamma_affn = gamma_affn - torch.ones_like(gamma_affn)
+        beta_affn = token_mixer.affine.bias
+        gamma_ln = norm.weight
+        beta_ln = norm.bias
+        print('gamma_affn:', gamma_affn.shape)
+        print('beta_affn:', beta_affn.shape)
+        print('gamma_ln:', gamma_ln.shape)
+        print('beta_ln:', beta_ln.shape)
+        return (gamma_ln * gamma_affn), (beta_ln * gamma_affn + beta_affn)
+
+    def get_equivalent_scale_bias(self):
+        eq_s, eq_b = self.fuse_affine(self.norm1, self.token_mixer)
+        return eq_s, eq_b
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return
+        eq_s, eq_b = self.get_equivalent_scale_bias()
+        self.norm_reparam = build_norm_layer(self.norm_cfg, self.dim)[1]
+        self.norm_reparam.weight.data = eq_s
+        self.norm_reparam.bias.data = eq_b
+        self.__delattr__('norm1')
+        if hasattr(self, 'token_mixer'):
+            self.__delattr__('token_mixer')
+        self.deploy = True
 
 
 def basic_blocks(dim,
                  index,
                  layers,
-                 pool_size=3,
                  mlp_ratio=4.,
                  norm_cfg=dict(type='GN', num_groups=1),
                  act_cfg=dict(type='GELU'),
                  drop_rate=.0,
                  drop_path_rate=0.,
-                 layer_scale_init_value=1e-5):
+                 layer_scale_init_value=1e-5,
+                 deploy=False):
     """
-    generate PoolFormer blocks for a stage
-    return: PoolFormer blocks
+    generate RIFormer blocks for a stage
+    return: RIFormer blocks
     """
     blocks = []
     for block_idx in range(layers[index]):
         block_dpr = drop_path_rate * (block_idx + sum(layers[:index])) / (
             sum(layers) - 1)
         blocks.append(
-            PoolFormerBlock(
+            RIFormerBlock(
                 dim,
-                pool_size=pool_size,
                 mlp_ratio=mlp_ratio,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg,
                 drop=drop_rate,
                 drop_path=block_dpr,
                 layer_scale_init_value=layer_scale_init_value,
+                deploy=deploy,
             ))
     blocks = nn.Sequential(*blocks)
 
@@ -195,18 +260,18 @@ def basic_blocks(dim,
 
 
 @MODELS.register_module()
-class PoolFormer(BaseBackbone):
-    """PoolFormer.
+class RIFormer(BaseBackbone):
+    """RIFormer.
 
-    A PyTorch implementation of PoolFormer introduced by:
-    `MetaFormer is Actually What You Need for Vision <https://arxiv.org/abs/2111.11418>`_
+    A PyTorch implementation of RIFormer introduced by:
+    `RIFormer: Keep Your Vision Backbone Effective But Removing Token Mixer <https://arxiv.org/abs/xxxx.xxxxx>`_
 
     Modified from the `official repo
-    <https://github.com/sail-sg/poolformer/blob/main/models/poolformer.py>`.
+    <https://github.com/techmonsterwang/RIFormer.py>`.
 
     Args:
         arch (str | dict): The model's architecture. If string, it should be
-            one of architecture in ``PoolFormer.arch_settings``. And if dict, it
+            one of architecture in ``RIFormer.arch_settings``. And if dict, it
             should include the following two keys:
 
             - layers (list[int]): Number of blocks at each stage.
@@ -240,6 +305,8 @@ class PoolFormer(BaseBackbone):
             Defaults to -1, means the last stage.
         frozen_stages (int): Stages to be frozen (all param fixed).
             Defaults to 0, which means not freezing any parameters.
+        deploy (bool): Whether to switch the model structure to
+            deployment mode. Default: False.
         init_cfg (dict, optional): Initialization config dict
     """  # noqa: E501
 
@@ -282,7 +349,6 @@ class PoolFormer(BaseBackbone):
 
     def __init__(self,
                  arch='s12',
-                 pool_size=3,
                  norm_cfg=dict(type='GN', num_groups=1),
                  act_cfg=dict(type='GELU'),
                  in_patch_size=7,
@@ -295,7 +361,8 @@ class PoolFormer(BaseBackbone):
                  drop_path_rate=0.,
                  out_indices=-1,
                  frozen_stages=0,
-                 init_cfg=None):
+                 init_cfg=None,
+                 deploy=False):
 
         super().__init__(init_cfg=init_cfg)
 
@@ -330,13 +397,13 @@ class PoolFormer(BaseBackbone):
                 embed_dims[i],
                 i,
                 layers,
-                pool_size=pool_size,
                 mlp_ratio=mlp_ratios[i],
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg,
                 drop_rate=drop_rate,
                 drop_path_rate=drop_path_rate,
-                layer_scale_init_value=layer_scale_init_value)
+                layer_scale_init_value=layer_scale_init_value,
+                deploy=deploy)
             network.append(stage)
             if i >= len(layers) - 1:
                 break
@@ -371,6 +438,7 @@ class PoolFormer(BaseBackbone):
 
         self.frozen_stages = frozen_stages
         self._freeze_stages()
+        self.deploy = deploy
 
     def forward_embeddings(self, x):
         x = self.patch_embed(x)
@@ -412,5 +480,19 @@ class PoolFormer(BaseBackbone):
                     param.requires_grad = False
 
     def train(self, mode=True):
-        super(PoolFormer, self).train(mode)
+        super(RIFormer, self).train(mode)
         self._freeze_stages()
+
+    def switch_to_deploy(self):
+        for m in self.modules():
+            if isinstance(m, RIFormerBlock):
+                m.switch_to_deploy()
+        self.deploy = True
+
+
+if __name__ == '__main__':
+    model = RIFormer(arch='s12', deploy=False)
+    model.eval()
+    print('------------------- training-time model -------------')
+    for i in model.state_dict().keys():
+        print(i)
